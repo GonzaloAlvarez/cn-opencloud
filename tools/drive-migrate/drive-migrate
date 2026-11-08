@@ -242,24 +242,32 @@ def cmd_auth(a: argparse.Namespace) -> None:
         if not a.client_id or not a.client_secret:
             die("--client-id and --client-secret are required (your own Google Cloud OAuth 'Desktop app' client, "
                 "project in Testing mode with you as a test user, scope drive.readonly)")
-        args = ["config", "create", "gdrive", "drive", "scope=drive.readonly", f"client_id={a.client_id}",
-                f"client_secret={a.client_secret}", "--non-interactive=false"]
+        # `rclone authorize` is the only command that can refrain from opening a
+        # browser: it prints the consent URL (stderr) and waits for Google to
+        # redirect back to 127.0.0.1:53682 on this machine, then prints the token
+        # block on stdout. The backend options travel as URL-safe unpadded base64
+        # JSON (standard base64 is rejected) — same dance as cn-printer's
+        # scripts/gdrive-auth.sh.
+        blob = base64.urlsafe_b64encode(json.dumps({"client_id": a.client_id, "client_secret": a.client_secret,
+                                                    "scope": "drive.readonly"}).encode()).decode().rstrip("=")
+        cmd = ["rclone", "authorize", "drive", blob]
         if a.open_browser:
-            log("rclone will open your default browser: sign in with the Google account that owns the Drive (read-only scope)")
+            log("rclone opens your default browser: sign in with the Google account that owns the Drive (read-only scope)")
         else:
-            # Print the consent URL instead of launching the default browser, so it
-            # can be pasted into whichever browser holds the right Google session.
-            # The redirect still comes back to 127.0.0.1:53682 on this machine.
-            args.append("--auth-no-open-browser")
-            log("rclone prints the Google consent URL below — open it in the browser that is signed in to the "
-                "Drive's Google account (same machine: the callback returns to 127.0.0.1:53682). "
-                "Pass --open-browser to launch the default browser instead.")
-        rclone(cfg, args, capture=False)
+            cmd.append("--auth-no-open-browser")
+            log("open the URL rclone prints below in the browser that is signed in to the Drive's Google account "
+                "(same machine: Google redirects back to 127.0.0.1:53682). --open-browser launches the default browser instead.")
+        proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE)
+        if proc.returncode != 0:
+            die("rclone authorize failed")
+        token = parse_authorize_output(proc.stdout)
+        rclone(cfg, ["config", "create", "gdrive", "drive", "scope=drive.readonly", f"client_id={a.client_id}",
+                     f"client_secret={a.client_secret}", f"token={token}", "--non-interactive"], capture=True)
         os.chmod(RCLONE_CONF, 0o600)
         out = rclone(cfg, ["lsd", "--max-depth", "1", "gdrive:"], capture=True, check=False)
         if out.returncode != 0:
             die("rclone cannot list gdrive: — " + out.stderr.strip()[-300:])
-        log(f"Drive answers; top-level folders:\n{out.stdout.rstrip()}")
+        log(f"Drive answers (read-only); top-level folders:\n{out.stdout.rstrip() or '  (none)'}")
     elif a.what == "opencloud":
         if not a.user or not a.token:
             die("--user and --token are required (OpenCloud app token: cn-opencloud/scripts/app-token.sh <user>)")
@@ -289,6 +297,32 @@ def cmd_auth(a: argparse.Namespace) -> None:
         save_config(cfg)
         Paperless(cfg).ping()
         log(f"Paperless answers at {cfg['paperless_url']}")
+
+
+def parse_authorize_output(text: str) -> str:
+    """Return the compact token JSON from `rclone authorize` output (between the
+    '--->' and '<---End paste' markers; JSON or a base64 blob holding it)."""
+    lines = text.splitlines()
+    try:
+        start = next(i for i, l in enumerate(lines) if l.strip().endswith("--->"))
+        end = next(i for i, l in enumerate(lines) if l.strip().startswith("<---End paste"))
+    except StopIteration:
+        die("could not find the token block in the rclone authorize output — re-run; make sure you completed the consent screen")
+    payload = "".join(l.strip() for l in lines[start + 1:end])
+    if payload.startswith("{"):
+        obj = json.loads(payload)
+    else:
+        pad = payload + "=" * (-len(payload) % 4)
+        try:
+            raw = base64.urlsafe_b64decode(pad)
+        except Exception:  # noqa: BLE001
+            raw = base64.b64decode(pad)
+        obj = json.loads(raw)
+    tok = obj.get("token", obj)
+    tok = json.loads(tok) if isinstance(tok, str) else tok
+    if not tok.get("access_token") or not tok.get("refresh_token"):
+        die("token is missing access_token/refresh_token — re-run; the consent must be approved for a Desktop-app client")
+    return json.dumps(tok, separators=(",", ":"))
 
 
 def fetch_ca(cfg: dict) -> None:
