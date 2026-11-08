@@ -241,8 +241,12 @@ services:
       AWS_SECRET_ACCESS_KEY: ${BACKUP_AWS_SECRET_ACCESS_KEY}
       AWS_DEFAULT_REGION: ${BACKUP_AWS_REGION}
       S3_REPOSITORY: s3:s3.${BACKUP_AWS_REGION}.amazonaws.com/${BACKUP_S3_BUCKET}/opencloud-restic
+      # the S3 repo is created on first use with the NAS repo's chunker params so
+      # `copy` deduplicates; afterwards every run copies the new snapshot and prunes
       POST_COMMANDS_SUCCESS: >-
-        restic -r $${S3_REPOSITORY} copy --from-repo $${RESTIC_REPOSITORY}
+        (restic -r $${S3_REPOSITORY} cat config >/dev/null 2>&1
+        || restic -r $${S3_REPOSITORY} init --from-repo $${RESTIC_REPOSITORY} --copy-chunker-params)
+        && restic -r $${S3_REPOSITORY} copy --from-repo $${RESTIC_REPOSITORY}
         && restic -r $${S3_REPOSITORY} forget --keep-weekly 8 --keep-monthly 6 --prune
     volumes:
       - /home/gonzalo/docker/data/nfs/backups/cn-opencloud:/backup-target
