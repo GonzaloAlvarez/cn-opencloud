@@ -93,10 +93,20 @@ def need(tool: str) -> None:
 
 
 # ── rclone ────────────────────────────────────────────────────────────────────
+SYSTEM_CA_BUNDLES = ["/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"]
+
+
 def rclone_base(cfg: dict) -> list[str]:
     cmd = ["rclone", "--config", RCLONE_CONF]
     ca = cfg.get("ca_cert")
     if ca and os.path.exists(ca):
+        # --ca-cert REPLACES the trust store: Google (and any public endpoint)
+        # must keep working, so the system bundle goes in next to the step-ca
+        # root that drive.lab.gn.al / docs.lab.gn.al carry on the LAN.
+        for bundle in SYSTEM_CA_BUNDLES:
+            if os.path.exists(bundle):
+                cmd += ["--ca-cert", bundle]
+                break
         cmd += ["--ca-cert", ca]
     return cmd
 
