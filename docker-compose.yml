@@ -1,0 +1,319 @@
+# cn-opencloud — OpenCloud (the Google Drive replacement: folders, any file,
+# share links, desktop/mobile sync) on kaiser.lan.
+#
+# Shape: homelab "sidecar stack" (cn-fitness is the reference). ts-drive owns
+# the netns; the single OpenCloud container joins it, so one tailnet identity
+# (drive.ts.gn.al, tag:svc) serves the VPS traefik-lab and the sidecar's
+# published 127.0.0.1:9200 serves cn-home's traefik-lan. Canonical origin is
+# https://drive.lab.gn.al on both sides (split horizon); drive.kaiser.lan 301s
+# to it in cn-home because OC_URL and the OIDC redirect URIs are bound to it.
+#
+# Identity: Authentik is the external IdP (public PKCE client `web`,
+# cn-authentik/setup-opencloud-oidc.sh); OpenCloud's built-in idp is excluded,
+# its built-in idm stays as the (autoprovisioned) user store; the `roles` claim
+# decides admin vs user. Storage: PosixFS on kaiser's SSD — a plain, browsable
+# tree under OC_DATA_DIR (xattrs carry the metadata, so never a NFSv3 export).
+# Backups: restic → raidnas NFS repo + S3 copy, Sunday 06:00 (scripts/backup.sh
+# via resiliency.yml). Pinned production image (7.2.x line): bump by hand with
+# the upgrade guide (`opencloud init --diff`); Watchtower is told to leave it.
+services:
+  # ── Tailscale sidecar: owns the netns shared by opencloud + exporters ──────
+  ts-drive:
+    image: tailscale/tailscale:latest
+    hostname: ts-drive
+    cap_add: [NET_ADMIN, SYS_MODULE]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+      - ts_state:/var/lib/tailscale
+      - /lib/modules:/lib/modules:ro
+    environment:
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_AUTHKEY=${DRIVE_AUTHKEY}
+      - TS_HOSTNAME=drive
+      - TS_ACCEPT_DNS=true
+      - TS_AUTH_ONCE=true
+      - TS_USERSPACE=false
+      - TS_TAILSCALED_EXTRA_ARGS=--tun=tailscale0
+      - TS_EXTRA_ARGS=--login-server=https://${HEADSCALE_DOMAIN}
+    ports:
+      # Host port 9200 — confirmed free on kaiser (ss -tlnp, 2026-11-07);
+      # OpenCloud's proxy listens on 9200 inside the netns.
+      - "127.0.0.1:9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "tailscale ip --4 >/dev/null 2>&1"]
+      interval: 10s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── OpenCloud: one binary, every service (proxy, web, graph, storage…) ─────
+  # `opencloud init || true` writes /etc/opencloud/opencloud.yaml ONCE with the
+  # retained secrets (jwt/transfer/machine-auth/service-account, storage mount
+  # id) and refuses to overwrite it afterwards — that file is state (Kauket
+  # kaiser.cn_opencloud_yaml). Environment always wins over the file.
+  opencloud:
+    image: opencloudeu/opencloud:7.2.4
+    network_mode: "service:ts-drive"
+    user: "1000:1000"
+    entrypoint: ["/bin/sh", "-c", "opencloud init || true; opencloud server"]
+    depends_on:
+      ts-drive:
+        condition: service_healthy
+    environment:
+      - OC_URL=https://drive.${LAB_DOMAIN}
+      - PROXY_TLS=false
+      - PROXY_HTTP_ADDR=0.0.0.0:9200
+      # proxy debug server (/metrics, /healthz) for the VPS Prometheus; reachable
+      # only on the sidecar's tailnet address (tag:infra + operator by ACL).
+      - PROXY_DEBUG_ADDR=0.0.0.0:9205
+      - OC_INSECURE=false
+      - OC_LOG_LEVEL=${OC_LOG_LEVEL:-info}
+      - OC_LOG_COLOR=false
+      - OC_LOG_PRETTY=false
+      - IDM_CREATE_DEMO_USERS=false
+      - IDM_ADMIN_PASSWORD=${OC_ADMIN_PASSWORD}
+      - PROXY_ENABLE_BASIC_AUTH=false
+      # ── Authentik as the external IdP (built-in idp off, built-in idm kept)
+      - OC_EXCLUDE_RUN_SERVICES=idp
+      - OC_OIDC_ISSUER=https://auth.${LAB_DOMAIN}/application/o/opencloud/
+      - PROXY_OIDC_REWRITE_WELLKNOWN=true
+      - PROXY_OIDC_ACCESS_TOKEN_VERIFY_METHOD=${OC_OIDC_VERIFY_METHOD:-jwt}
+      - PROXY_AUTOPROVISION_ACCOUNTS=true
+      - PROXY_USER_OIDC_CLAIM=preferred_username
+      - PROXY_USER_CS3_CLAIM=username
+      - PROXY_AUTOPROVISION_CLAIM_USERNAME=preferred_username
+      - PROXY_AUTOPROVISION_CLAIM_EMAIL=email
+      - PROXY_AUTOPROVISION_CLAIM_DISPLAYNAME=name
+      # roles come from Authentik's `roles` scope: infra-admins → opencloudAdmin,
+      # everyone else → opencloudUser (the driver's default mapping)
+      - PROXY_ROLE_ASSIGNMENT_DRIVER=oidc
+      - PROXY_ROLE_ASSIGNMENT_OIDC_CLAIM=roles
+      - GRAPH_ASSIGN_DEFAULT_USER_ROLE=false
+      - SETTINGS_SETUP_DEFAULT_ASSIGNMENTS=false
+      - OC_ADMIN_USER_ID=
+      - WEB_OIDC_CLIENT_ID=web
+      - WEB_OIDC_SCOPE=openid profile email roles offline_access
+      - WEBFINGER_WEB_OIDC_CLIENT_ID=web
+      - WEBFINGER_WEB_OIDC_CLIENT_SCOPES=openid profile email roles offline_access
+      - IDP_DOMAIN=auth.${LAB_DOMAIN}
+      - PROXY_CSP_CONFIG_FILE_LOCATION=/etc/opencloud/csp.yaml
+      # ── storage: PosixFS (default driver), non-collaborative — the tree is
+      # OpenCloud's; the Drive migration writes through WebDAV, not the disk.
+      - STORAGE_USERS_POSIX_WATCH_FS=false
+      - OC_DEFAULT_LANGUAGE=en
+      - FRONTEND_CHECK_FOR_UPDATES=false
+      - FRONTEND_ARCHIVER_MAX_SIZE=10000000000
+      # ── notification mail — shared Mailgun
+      - NOTIFICATIONS_SMTP_HOST=${SMTP_HOST}
+      - NOTIFICATIONS_SMTP_PORT=${SMTP_PORT}
+      - NOTIFICATIONS_SMTP_SENDER=${OC_SMTP_SENDER}
+      - NOTIFICATIONS_SMTP_USERNAME=${SMTP_USERNAME}
+      - NOTIFICATIONS_SMTP_PASSWORD=${SMTP_PASSWORD}
+      - NOTIFICATIONS_SMTP_AUTHENTICATION=login
+      - NOTIFICATIONS_SMTP_ENCRYPTION=starttls
+      - TZ=${TIMEZONE}
+    volumes:
+      - ./config/opencloud:/etc/opencloud                        # opencloud.yaml (RETAINED) — written by init
+      - ./csp.yaml:/etc/opencloud/csp.yaml:ro
+      - ${OC_DATA_DIR:-/home/gonzalo/docker/cn-opencloud/data}:/var/lib/opencloud   # PosixFS tree + system data (local SSD)
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://127.0.0.1:9200/status.php >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"   # pinned production tag; upgrade by hand (README)
+    restart: unless-stopped
+
+  # ── Consul self-registration: makes drive.lab.gn.al routable via traefik-lab ──
+  consul-register:
+    image: curlimages/curl:8.8.0
+    network_mode: "service:ts-drive"
+    environment:
+      - CONSUL_ADDR=http://${INFRA_VPS_TAILNET_IP}:8500
+      - TAILNET_HOST=drive.${TAILNET_DOMAIN}
+      - LAB_DOMAIN=${LAB_DOMAIN}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        register() {
+          NAME=$$1; PORT=$$2; SUB=$$3
+          PAYLOAD=$$(cat <<JSON
+        {
+          "Name": "$$NAME",
+          "ID": "$$NAME-opencloud",
+          "Address": "$$TAILNET_HOST",
+          "Port": $$PORT,
+          "Tags": [
+            "traefik.enable=true",
+            "traefik.http.routers.$$NAME.rule=Host(\`$$SUB.$$LAB_DOMAIN\`)",
+            "traefik.http.routers.$$NAME.entrypoints=websecure",
+            "traefik.http.routers.$$NAME.tls=true",
+            "traefik.http.routers.$$NAME.tls.certresolver=dns"
+          ],
+          "Check": {
+            "TCP": "$$TAILNET_HOST:$$PORT",
+            "Interval": "10s",
+            "DeregisterCriticalServiceAfter": "2m"
+          }
+        }
+        JSON
+          )
+          curl -sf -X PUT "$$CONSUL_ADDR/v1/agent/service/register" \
+               -H "Content-Type: application/json" -d "$$PAYLOAD" >/dev/null \
+            && echo "registered $$NAME ($$SUB.$$LAB_DOMAIN -> :$$PORT)" \
+            || echo "FAILED to register $$NAME" >&2
+        }
+        while true; do
+          register drive 9200 drive
+          sleep 60
+        done
+    depends_on:
+      ts-drive:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── promtail: ship container logs to VPS Loki ──
+  promtail:
+    image: grafana/promtail:3.4.2
+    network_mode: "service:ts-drive"
+    command: ["-config.file=/etc/promtail/promtail.yml", "-config.expand-env=true"]
+    volumes:
+      - ./promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - INFRA_VPS_TAILNET_IP=${INFRA_VPS_TAILNET_IP}
+    depends_on:
+      ts-drive:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── node-exporter: host metrics (:9100) + this stack's textfile metrics ──
+  # ./textfile carries opencloud_backup_* from scripts/backup.sh (a dedicated
+  # dir: the host-wide textfile dir would re-export kaiser's resilience_*
+  # series under this stack's labels).
+  node-exporter:
+    image: prom/node-exporter:latest
+    network_mode: "service:ts-drive"
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+      - "--collector.textfile.directory=/textfile"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      - ./textfile:/textfile:ro
+    depends_on:
+      ts-drive:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── backup: restic, run on demand by scripts/backup.sh (profile `tools`) ──
+  # Incremental snapshots of the PosixFS tree (+ the config dir) straight into
+  # the raidnas NFS repo, then a dedup `restic copy` to S3 for off-site DR —
+  # the cn-immich model (no local tar). RESTIC_PASSWORD is LOAD-BEARING.
+  # Search index and thumbnails are excluded (rebuilt after a restore).
+  backup:
+    image: mazzolino/restic:1.8.2
+    profiles: ["tools"]
+    hostname: cn-opencloud
+    environment:
+      RESTIC_REPOSITORY: /backup-target/restic
+      RESTIC_PASSWORD: ${RESTIC_PASSWORD}
+      RESTIC_FROM_PASSWORD: ${RESTIC_PASSWORD}
+      RESTIC_BACKUP_SOURCES: /data /config
+      RESTIC_BACKUP_ARGS: --tag cn-opencloud --exclude /data/search --exclude /data/thumbnails --exclude-caches
+      RESTIC_FORGET_ARGS: --keep-weekly 8 --keep-monthly 6 --prune
+      TZ: ${TIMEZONE}
+      AWS_ACCESS_KEY_ID: ${BACKUP_AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${BACKUP_AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${BACKUP_AWS_REGION}
+      S3_REPOSITORY: s3:s3.${BACKUP_AWS_REGION}.amazonaws.com/${BACKUP_S3_BUCKET}/opencloud-restic
+      POST_COMMANDS_SUCCESS: >-
+        restic -r $${S3_REPOSITORY} copy --from-repo $${RESTIC_REPOSITORY}
+        && restic -r $${S3_REPOSITORY} forget --keep-weekly 8 --keep-monthly 6 --prune
+    volumes:
+      - /home/gonzalo/docker/data/nfs/backups/cn-opencloud:/backup-target
+      - ${OC_DATA_DIR:-/home/gonzalo/docker/cn-opencloud/data}:/data:ro
+      - ./config/opencloud:/config:ro
+    restart: "no"
+
+  # ── ts-drive watchdog: force-recreate dependents on netns drift ──
+  # Copied whole from cn-fitness (see its comment block).
+  ts-drive-watchdog:
+    image: docker:cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}:${PWD}
+    working_dir: ${PWD}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        until apk add --no-cache docker-cli-compose >/dev/null 2>&1; do echo "[watchdog] waiting for network to install docker-cli-compose"; sleep 5; done
+        DEPS="opencloud consul-register promtail node-exporter"
+        ACTION_THRESHOLD=3
+        ACTION_COUNT=0
+        echo "[watchdog] ready, polling dependents every 10s ($$DEPS), drift threshold $$ACTION_THRESHOLD polls"
+        while true; do
+          TS_ID=$$(docker inspect cn-opencloud-ts-drive-1 --format "{{.Id}}" 2>/dev/null || true)
+          if [ -n "$$TS_ID" ]; then
+            NEED_RECREATE=""
+            NEED_START=""
+            for dep in $$DEPS; do
+              INFO=$$(docker inspect cn-opencloud-$$dep-1 --format "{{.HostConfig.NetworkMode}} {{.State.Status}}" 2>/dev/null || true)
+              [ -n "$$INFO" ] || continue
+              DEP_NM=$$(echo "$$INFO" | awk "{print \$$1}")
+              DEP_STATUS=$$(echo "$$INFO" | awk "{print \$$2}")
+              DEP_TARGET=$${DEP_NM#container:}
+              if [ "$$DEP_TARGET" != "$$TS_ID" ]; then
+                NEED_RECREATE="$$NEED_RECREATE $$dep"
+              elif [ "$$DEP_STATUS" != "running" ]; then
+                NEED_START="$$NEED_START $$dep"
+              fi
+            done
+            if [ -n "$$NEED_RECREATE" ] || [ -n "$$NEED_START" ]; then
+              ACTION_COUNT=$$((ACTION_COUNT + 1))
+              if [ "$$ACTION_COUNT" -ge "$$ACTION_THRESHOLD" ]; then
+                if [ -n "$$NEED_RECREATE" ]; then
+                  echo "[watchdog] persistent drift on:$$NEED_RECREATE -- recreating"
+                  docker compose -p cn-opencloud up -d --force-recreate --no-deps $$NEED_RECREATE \
+                    && echo "[watchdog] recreate OK" || echo "[watchdog] recreate FAILED"
+                fi
+                if [ -n "$$NEED_START" ]; then
+                  echo "[watchdog] persistent stopped on:$$NEED_START -- starting"
+                  docker compose -p cn-opencloud start $$NEED_START \
+                    && echo "[watchdog] start OK" || echo "[watchdog] start FAILED"
+                fi
+                ACTION_COUNT=0
+              else
+                echo "[watchdog] action pending (drift:$$NEED_RECREATE start:$$NEED_START count=$$ACTION_COUNT/$$ACTION_THRESHOLD)"
+              fi
+            else
+              ACTION_COUNT=0
+            fi
+          fi
+          sleep 10
+        done
+    restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      driver: default
+      config:
+        # 172.30.9.0/24 — next in the fleet sequence after cn-paperless (.8).
+        - subnet: 172.30.9.0/24
+          ip_range: 172.30.9.128/25
+
+volumes:
+  ts_state:

@@ -1,0 +1,15 @@
+# amun-docker resiliency manifest — installs a docker-compose@cn-opencloud boot
+# unit + an /etc/cron.d reconcile job + the weekly restic backup. See the
+# amun-docker README. No NFS gate: OpenCloud's PosixFS tree is on kaiser's SSD
+# (NFSv3 has neither xattrs nor inotify); only the backup touches the NAS and
+# checks the mount itself.
+boot:
+  enabled: true
+reconcile:
+  enabled: true
+  schedule: "*/5 * * * *"
+cron:
+  # Sunday 06:00: restic → raidnas repo, then `restic copy` → S3 (scripts/backup.sh).
+  # Taken slots: 01:30 printer, 02:00 dnsdhcpd, 03:00 fitness/vaultwarden/nvr,
+  # 03:30 authentik, 04:15 sms, 04:30 mzfxa, 05:00 librechat, 05:30 paperless.
+  - { name: backup, schedule: "0 6 * * 0", script: scripts/backup.sh }

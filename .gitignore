@@ -1,0 +1,7 @@
+.env
+config/opencloud/
+promtail/promtail.yml
+textfile/
+*.bak
+.DS_Store
+__pycache__/

@@ -1,0 +1,51 @@
+# cn-opencloud — Content-Security-Policy for the OpenCloud web UI
+# (PROXY_CSP_CONFIG_FILE_LOCATION). Upstream's template with our IdP: the web
+# client's silent token renewal runs in an iframe against Authentik, so
+# auth.lab.gn.al must be allowed in connect-src, frame-src and script-src
+# (the documented "silent token renewal failed" fix). No Collabora / companion
+# / update-check hosts: those features are off.
+directives:
+  child-src:
+    - "'self'"
+  connect-src:
+    - "'self'"
+    - 'blob:'
+    - 'https://auth.lab.gn.al/'
+    - 'https://raw.githubusercontent.com/opencloud-eu/awesome-apps/'
+    - 'https://tile.openstreetmap.org/'
+  default-src:
+    - "'none'"
+  font-src:
+    - "'self'"
+  frame-ancestors:
+    - "'self'"
+  frame-src:
+    - "'self'"
+    - 'blob:'
+    - 'https://embed.diagrams.net/'
+    - 'https://auth.lab.gn.al/'
+  img-src:
+    - "'self'"
+    - 'data:'
+    - 'blob:'
+    - 'https://raw.githubusercontent.com/opencloud-eu/awesome-apps/'
+    - 'https://tile.openstreetmap.org/'
+  manifest-src:
+    - "'self'"
+  media-src:
+    - "'self'"
+    - 'blob:'
+  object-src:
+    - "'self'"
+    - 'blob:'
+  script-src:
+    - "'self'"
+    - "'unsafe-inline'"
+    - 'https://auth.lab.gn.al/'
+  style-src:
+    - "'self'"
+    - "'unsafe-inline'"
+    - 'blob:'
+  worker-src:
+    - "'self'"
+    - 'blob:'
