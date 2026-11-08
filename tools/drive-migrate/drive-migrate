@@ -4,8 +4,9 @@ OpenCloud (rclone mirror, 1:1 folders) and a picked subset of documents into
 Paperless-ngx (REST API, tags from the folder path). Runs on the operator Mac
 at home; stdlib + rclone + fzf. State lives in ~/.config/drive-migrate (0700).
 
-  drive-migrate auth drive --client-id ID --client-secret SECRET
-        rclone remote `gdrive` (scope drive.readonly) — opens the browser once
+  drive-migrate auth drive --client-id ID --client-secret SECRET [--open-browser]
+        rclone remote `gdrive` (scope drive.readonly) — prints the Google consent
+        URL to paste into any browser on this machine (--open-browser launches it)
   drive-migrate auth opencloud --user USER --token APP_TOKEN [--url https://drive.lab.gn.al]
         rclone remote `opencloud` (webdav, vendor infinitescale) with an app token
   drive-migrate auth paperless --token API_TOKEN [--url https://docs.lab.gn.al]
@@ -241,9 +242,19 @@ def cmd_auth(a: argparse.Namespace) -> None:
         if not a.client_id or not a.client_secret:
             die("--client-id and --client-secret are required (your own Google Cloud OAuth 'Desktop app' client, "
                 "project in Testing mode with you as a test user, scope drive.readonly)")
-        log("rclone will open the browser: sign in with the Google account that owns the Drive (read-only scope)")
-        rclone(cfg, ["config", "create", "gdrive", "drive", "scope=drive.readonly", f"client_id={a.client_id}",
-                     f"client_secret={a.client_secret}", "--non-interactive=false"], capture=False)
+        args = ["config", "create", "gdrive", "drive", "scope=drive.readonly", f"client_id={a.client_id}",
+                f"client_secret={a.client_secret}", "--non-interactive=false"]
+        if a.open_browser:
+            log("rclone will open your default browser: sign in with the Google account that owns the Drive (read-only scope)")
+        else:
+            # Print the consent URL instead of launching the default browser, so it
+            # can be pasted into whichever browser holds the right Google session.
+            # The redirect still comes back to 127.0.0.1:53682 on this machine.
+            args.append("--auth-no-open-browser")
+            log("rclone prints the Google consent URL below — open it in the browser that is signed in to the "
+                "Drive's Google account (same machine: the callback returns to 127.0.0.1:53682). "
+                "Pass --open-browser to launch the default browser instead.")
+        rclone(cfg, args, capture=False)
         os.chmod(RCLONE_CONF, 0o600)
         out = rclone(cfg, ["lsd", "--max-depth", "1", "gdrive:"], capture=True, check=False)
         if out.returncode != 0:
@@ -470,6 +481,7 @@ def main() -> None:
     pa = sub.add_parser("auth"); pa.add_argument("what", choices=["drive", "opencloud", "paperless"])
     pa.add_argument("--client-id"); pa.add_argument("--client-secret"); pa.add_argument("--user"); pa.add_argument("--token")
     pa.add_argument("--url", default=None); pa.add_argument("--no-fetch-ca", dest="fetch_ca", action="store_false")
+    pa.add_argument("--open-browser", action="store_true", help="auth drive: launch the default browser instead of printing the URL")
     pa.set_defaults(func=cmd_auth)
     pm = sub.add_parser("mirror"); pm.add_argument("--dest", default="Google Drive"); pm.add_argument("--dry-run", action="store_true")
     pm.add_argument("--filter-from"); pm.add_argument("--transfers", type=int, default=4); pm.set_defaults(func=cmd_mirror)

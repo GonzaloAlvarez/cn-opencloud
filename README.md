@@ -57,7 +57,7 @@ Store `config/opencloud/opencloud.yaml` in Kauket right after the first run (the
 A stdlib Python CLI (plus `rclone` ≥ 1.75 and `fzf`) that runs on the operator Mac at home; state in `~/.config/drive-migrate/` (0700, nothing in Git). Google side, once: your **own** Google Cloud project with the Drive API enabled, an OAuth *Desktop app* client, scope `drive.readonly`, consent screen in *Testing* with you as test user (a restricted scope in a published app would need Google verification; in Testing the grant expires after 7 days — just re-run `auth drive`). Keep it separate from cn-printer's `drive.file` client.
 
 ```sh
-tools/drive-migrate/drive-migrate auth drive --client-id … --client-secret …   # browser consent, read-only
+tools/drive-migrate/drive-migrate auth drive --client-id … --client-secret …   # prints the consent URL (paste it in the browser with the right Google account); --open-browser to launch one
 tools/drive-migrate/drive-migrate auth opencloud --user gonzalo --token "$(ssh kaiser.lan ~/cn-opencloud/scripts/app-token.sh gonzalo)"
 tools/drive-migrate/drive-migrate auth paperless --token <API token>          # a Paperless user's token (My Profile)
 tools/drive-migrate/drive-migrate mirror --dry-run && tools/drive-migrate/drive-migrate mirror   # whole tree → OpenCloud "Google Drive/"
