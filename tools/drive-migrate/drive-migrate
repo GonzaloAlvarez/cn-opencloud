@@ -140,7 +140,7 @@ def listing(cfg: dict, source: str, refresh: bool) -> list[dict]:
     log(f"listing {remote} recursively (this can take a while on a big Drive)…")
     args = ["lsjson", "-R", "--files-only", "-M", remote]
     if source == "gdrive":
-        args += ["--drive-export-formats", EXPORT_FORMATS]
+        args += ["--drive-export-formats", EXPORT_FORMATS, "--drive-skip-dangling-shortcuts"]
     out = rclone(cfg, args, capture=True).stdout
     items = json.loads(out)
     with open(path, "w") as f:
@@ -360,7 +360,11 @@ def cmd_mirror(a: argparse.Namespace) -> None:
     ensure_dirs()
     dest = f"opencloud:{a.dest.strip('/')}/"
     logf = os.path.join(LOGS, f"mirror-{dt.datetime.now():%Y%m%d-%H%M%S}.log")
-    args = ["copy", "gdrive:", dest, "--drive-export-formats", EXPORT_FORMATS, "--create-empty-src-dirs",
+    # --drive-skip-dangling-shortcuts: a Drive shortcut whose target was deleted or
+    # is not shared with this account cannot be read ("can't read dangling
+    # shortcut") — skip it instead of counting an error per run.
+    args = ["copy", "gdrive:", dest, "--drive-export-formats", EXPORT_FORMATS, "--drive-skip-dangling-shortcuts",
+            "--create-empty-src-dirs",
             "--transfers", str(a.transfers), "--checkers", "8", "--stats", "30s", "--stats-one-line", "--progress",
             "--log-level", "INFO", "--log-file", logf, "--retries", "5", "--low-level-retries", "20"]
     if a.filter_from:
