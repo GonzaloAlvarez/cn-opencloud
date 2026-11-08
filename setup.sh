@@ -72,7 +72,7 @@ cn-opencloud is up.
   Files on disk  :  ${DATA_DIR}/storage/users/{users,projects}/<id>/  (PosixFS, owner 1000)
   Backup         :  scripts/backup.sh (Sun 06:00 via amun docker) → raidnas restic repo + S3 copy
   App tokens     :  scripts/app-token.sh <user> [expiry]   (WebDAV / rclone / drive-migrate)
-  Metrics        :  :9100 node-exporter · :9205 proxy debug (VPS scrapes drive.ts.gn.al)
+  Metrics        :  :9400 node-exporter · :9205 proxy debug (VPS scrapes drive.ts.gn.al)
 
   Then           :  amun docker        # installs the boot unit, reconcile cron and the backup cron
 ===============================================================

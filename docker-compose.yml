@@ -194,14 +194,17 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── node-exporter: host metrics (:9100) + this stack's textfile metrics ──
-  # ./textfile carries opencloud_backup_* from scripts/backup.sh (a dedicated
-  # dir: the host-wide textfile dir would re-export kaiser's resilience_*
-  # series under this stack's labels).
+  # ── node-exporter: host metrics (:9400) + this stack's textfile metrics ──
+  # NOT :9100 — inside this netns OpenCloud's own `web` service listens on
+  # 127.0.0.1:9100 (the single binary owns 9100-9299). ./textfile carries
+  # opencloud_backup_* from scripts/backup.sh (a dedicated dir: the host-wide
+  # textfile dir would re-export kaiser's resilience_* series under this
+  # stack's labels).
   node-exporter:
     image: prom/node-exporter:latest
     network_mode: "service:ts-drive"
     command:
+      - "--web.listen-address=:9400"
       - "--path.procfs=/host/proc"
       - "--path.sysfs=/host/sys"
       - "--path.rootfs=/rootfs"

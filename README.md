@@ -71,7 +71,7 @@ Upstream wants the instance **stopped** for a consistent backup. The scheduled r
 
 ## Observability
 
-VPS plane: jobs `opencloud-node` (`drive.ts.gn.al:9100`, with `opencloud_backup_*` from `./textfile`) and `opencloud` (`drive.ts.gn.al:9205` — proxy metrics `opencloud_proxy_requests_total`, `_errors_total`, `_duration_seconds`), probe `https://drive.lab.gn.al/status.php` (200, unauthenticated JSON), promtail → VPS Loki under `stack=cn-opencloud`, alert group `cn-opencloud`. LAN plane: kaiser probes `https://drive.kaiser.lan` (301). Glance and dynacat list it under Apps.
+VPS plane: jobs `opencloud-node` (`drive.ts.gn.al:9400` — 9100 belongs to OpenCloud's `web` service inside the netns; with `opencloud_backup_*` from `./textfile`) and `opencloud` (`drive.ts.gn.al:9205` — proxy metrics `opencloud_proxy_requests_total`, `_errors_total`, `_duration_seconds`), probe `https://drive.lab.gn.al/status.php` (200, unauthenticated JSON), promtail → VPS Loki under `stack=cn-opencloud`, alert group `cn-opencloud`. LAN plane: kaiser probes `https://drive.kaiser.lan` (301). Glance and dynacat list it under Apps.
 
 Health first: `docker compose ps` · `curl -s https://drive.lab.gn.al/status.php` · `docker compose logs --tail=100 opencloud` (JSON lines) · `docker compose exec opencloud opencloud posixfs consistency`.
 
