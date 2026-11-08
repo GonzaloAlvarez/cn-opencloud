@@ -42,7 +42,9 @@ fi
 
 start=$(date +%s)
 log "restic backup → $REPO (then copy → S3)"
-if docker compose -p "$P" run --rm --no-deps backup backup; then
+# the image treats a plain argument as a restic subcommand; its scheduled job
+# (RESTIC_BACKUP_SOURCES, forget, POST_COMMANDS_SUCCESS) is /usr/local/bin/backup
+if docker compose -p "$P" run --rm --no-deps --entrypoint /usr/local/bin/backup backup; then
   end=$(date +%s)
   mkdir -p textfile
   {
