@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# drive-migrate self-test: rclone `alias` remotes stand in for Google Drive and
+# OpenCloud (two temp trees), forwarder/tests' fake Paperless API stands in for
+# docs.lab.gn.al. Proves: mirror (dry-run, real, idempotent), verify, push with
+# tags from the folder path (dry-run, real, re-run skips), ledger + status.
+#   ./test [--keep]
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"; cd "$HERE"
+KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
+PASS=0; FAIL=0
+ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$1"; PASS=$((PASS+1)); }
+bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; FAIL=$((FAIL+1)); }
+check(){ local l="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$l"; else bad "$l"; fi; }
+command -v rclone >/dev/null || { echo "rclone required"; exit 2; }
+
+T="$(mktemp -d "${TMPDIR:-/tmp}/drive-migrate-test.XXXXXX")"
+export DRIVE_MIGRATE_HOME="$T/home"
+mkdir -p "$DRIVE_MIGRATE_HOME" "$T/drive/Finance/2024" "$T/drive/Notes/Ideas" "$T/drive/Photos" "$T/cloud" "$T/pl-out"
+chmod 700 "$DRIVE_MIGRATE_HOME"
+printf '%%PDF-1.4 invoice\n' > "$T/drive/Finance/2024/invoice.pdf"
+printf '%%PDF-1.4 receipt\n' > "$T/drive/Finance/2024/receipt.pdf"
+printf 'todo list\n'        > "$T/drive/Notes/Ideas/todo.txt"
+head -c 2048 /dev/urandom   > "$T/drive/Photos/pic.jpg"
+cat > "$DRIVE_MIGRATE_HOME/rclone.conf" <<RC
+[gdrive]
+type = alias
+remote = $T/drive
+
+[opencloud]
+type = alias
+remote = $T/cloud
+RC
+PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+PORT="$PORT" OUT_DIR="$T/pl-out" FAKE_TOKEN=tok FAIL_NAMES=receipt.pdf python3 tests/fake_paperless.py >"$T/fake.log" 2>&1 &
+FAKE=$!
+cleanup() { kill "$FAKE" 2>/dev/null || true; if [ "$KEEP" -eq 1 ]; then echo "[test] --keep: $T"; else rm -rf "$T"; fi; }
+trap cleanup EXIT
+for _ in $(seq 1 20); do curl -fs -H 'Authorization: Token tok' "http://127.0.0.1:$PORT/api/tags/?page_size=1" >/dev/null 2>&1 && break; sleep 0.3; done
+printf 'tok\n' > "$DRIVE_MIGRATE_HOME/paperless.token"
+printf '{"paperless_url": "http://127.0.0.1:%s", "paperless_token_file": "%s/paperless.token"}\n' "$PORT" "$DRIVE_MIGRATE_HOME" > "$DRIVE_MIGRATE_HOME/config.json"
+DM=./drive-migrate
+
+echo "== drive-migrate test =="
+check "compiles" python3 -m py_compile drive-migrate
+check "mirror --dry-run copies nothing" bash -c "$DM mirror --dry-run >/dev/null && [ -z \"\$(ls -A '$T/cloud')\" ]"
+check "mirror copies the tree 1:1" bash -c "$DM mirror >/dev/null && diff -r '$T/drive' '$T/cloud/Google Drive'"
+check "verify passes" "$DM" verify
+check "second mirror is a no-op (nothing transferred)" bash -c "$DM mirror 2>&1 | grep -q 'mirror finished' && diff -r '$T/drive' '$T/cloud/Google Drive'"
+printf 'Finance/2024/invoice.pdf\nFinance/2024/receipt.pdf\nNotes/Ideas/todo.txt\n' > "$T/sel.txt"
+check "pick listing can be built (lsjson cache)" bash -c "$DM push --selection '$T/sel.txt' --dry-run >/dev/null; ls '$DRIVE_MIGRATE_HOME'/listing-gdrive.json"
+check "push --dry-run uploads nothing" bash -c "[ -z \"\$(ls -A '$T/pl-out')\" ] && ! [ -f '$DRIVE_MIGRATE_HOME/ledger.csv' ]"
+set +e; "$DM" push --selection "$T/sel.txt" --tags-from-path >"$T/push.log" 2>&1; rc=$?; set -e
+check "push exits 1 when one file is rejected" test "$rc" -eq 1
+check "two files reached Paperless, the rejected one too (fake saves then fails)" bash -c "[ -f '$T/pl-out/invoice.pdf' ] && [ -f '$T/pl-out/todo.txt' ]"
+check "ledger: 2 success + 1 failure" bash -c "grep -c ',success,' '$DRIVE_MIGRATE_HOME/ledger.csv' | grep -qx 2 && grep -c ',failure,' '$DRIVE_MIGRATE_HOME/ledger.csv' | grep -qx 1"
+check "tags from path were created (gdrive-import, Finance, 2024, Notes, Ideas)" bash -c "grep -c -E 'POST /api/tags/' '$T/fake.log' | grep -qx 5"
+set +e; "$DM" push --selection "$T/sel.txt" --tags-from-path >"$T/push2.log" 2>&1; rc2=$?; set -e
+check "re-run skips the two done, retries the failed one" bash -c "grep -q '0 imported, 2 already done, 1 failed' '$T/push2.log'"
+check "status summarises the ledger" bash -c "$DM status | grep -q 'ledger:'"
+echo "== Summary ==  Pass: $PASS  Fail: $FAIL"
+[ "$FAIL" -eq 0 ] && echo "[test] PASS" || { echo "[test] FAIL"; sed 's/^/      | /' "$T/push.log" | tail -20; exit 1; }

@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""drive-migrate — move a Google Drive out of Google: the whole tree into
+OpenCloud (rclone mirror, 1:1 folders) and a picked subset of documents into
+Paperless-ngx (REST API, tags from the folder path). Runs on the operator Mac
+at home; stdlib + rclone + fzf. State lives in ~/.config/drive-migrate (0700).
+
+  drive-migrate auth drive --client-id ID --client-secret SECRET
+        rclone remote `gdrive` (scope drive.readonly) — opens the browser once
+  drive-migrate auth opencloud --user USER --token APP_TOKEN [--url https://drive.lab.gn.al]
+        rclone remote `opencloud` (webdav, vendor infinitescale) with an app token
+  drive-migrate auth paperless --token API_TOKEN [--url https://docs.lab.gn.al]
+  drive-migrate mirror [--dest "Google Drive"] [--dry-run] [--filter-from FILE]
+        rclone copy gdrive: → opencloud:<dest>/ (resumable; Docs/Sheets/Slides
+        exported as docx/xlsx/pptx; re-runs copy only what changed)
+  drive-migrate verify [--dest "Google Drive"]
+        rclone check (one way) for regular files + name check for exported Google docs
+  drive-migrate pick [--refresh] [--source gdrive|takeout:/path] [--out FILE]
+        fzf multi-select over the cached listing → a selection file
+  drive-migrate push --selection FILE [--tags-from-path] [--tag NAME]... [--dry-run] [--source ...]
+        download each pick, POST it to Paperless (title, created, tags), wait for
+        the task, record it in the ledger; re-runs skip what already succeeded
+  drive-migrate status
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import csv
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import shutil
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+CFG_DIR = os.path.expanduser(os.environ.get("DRIVE_MIGRATE_HOME", "~/.config/drive-migrate"))
+RCLONE_CONF = os.path.join(CFG_DIR, "rclone.conf")
+CONFIG = os.path.join(CFG_DIR, "config.json")
+LEDGER = os.path.join(CFG_DIR, "ledger.csv")
+LISTING = os.path.join(CFG_DIR, "listing-%s.json")
+LOGS = os.path.join(CFG_DIR, "logs")
+EXPORT_FORMATS = "docx,xlsx,pptx,pdf"
+GDOC_EXPORT = {"application/vnd.google-apps.document": "docx", "application/vnd.google-apps.spreadsheet": "xlsx",
+               "application/vnd.google-apps.presentation": "pptx", "application/vnd.google-apps.drawing": "pdf"}
+LEDGER_FIELDS = ["ts", "source", "path", "drive_id", "size", "modtime", "task_id", "status", "document_id", "note"]
+
+
+def log(msg: str) -> None:
+    print(f"[drive-migrate] {msg}", flush=True)
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"[drive-migrate] ERROR: {msg}", file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+def ensure_dirs() -> None:
+    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    os.chmod(CFG_DIR, 0o700)
+    os.makedirs(LOGS, exist_ok=True)
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    ensure_dirs()
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG)
+
+
+def need(tool: str) -> None:
+    if shutil.which(tool) is None:
+        die(f"{tool} is not installed (brew install {tool})")
+
+
+# ── rclone ────────────────────────────────────────────────────────────────────
+def rclone_base(cfg: dict) -> list[str]:
+    cmd = ["rclone", "--config", RCLONE_CONF]
+    ca = cfg.get("ca_cert")
+    if ca and os.path.exists(ca):
+        cmd += ["--ca-cert", ca]
+    return cmd
+
+
+def rclone(cfg: dict, args: list[str], capture: bool = False, check: bool = True) -> subprocess.CompletedProcess:
+    cmd = rclone_base(cfg) + args
+    if os.environ.get("DRIVE_MIGRATE_DEBUG"):
+        log("$ " + " ".join(shlex.quote(a) for a in cmd))
+    return subprocess.run(cmd, text=True, capture_output=capture, check=check)
+
+
+def source_remote(source: str) -> str:
+    """'gdrive' → 'gdrive:' ; 'takeout:/path' → '/path' (rclone local)."""
+    if source == "gdrive":
+        return "gdrive:"
+    if source.startswith("takeout:"):
+        p = os.path.expanduser(source.split(":", 1)[1])
+        if not os.path.isdir(p):
+            die(f"takeout path {p} is not a directory")
+        return p.rstrip("/") + "/"
+    die(f"unknown source {source!r} (gdrive | takeout:/path)")
+
+
+def listing(cfg: dict, source: str, refresh: bool) -> list[dict]:
+    key = re.sub(r"[^A-Za-z0-9]+", "-", source)
+    path = LISTING % key
+    if not refresh and os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    remote = source_remote(source)
+    log(f"listing {remote} recursively (this can take a while on a big Drive)…")
+    args = ["lsjson", "-R", "--files-only", "-M", remote]
+    if source == "gdrive":
+        args += ["--drive-export-formats", EXPORT_FORMATS]
+    out = rclone(cfg, args, capture=True).stdout
+    items = json.loads(out)
+    with open(path, "w") as f:
+        json.dump(items, f)
+    log(f"{len(items)} files cached in {path}")
+    return items
+
+
+# ── Paperless ─────────────────────────────────────────────────────────────────
+class Paperless:
+    def __init__(self, cfg: dict):
+        self.url = (cfg.get("paperless_url") or "").rstrip("/")
+        self.token = read_secret(cfg.get("paperless_token_file", ""))
+        if not self.url or not self.token:
+            die("Paperless is not configured — run: drive-migrate auth paperless --token …")
+        ca = cfg.get("ca_cert")
+        self.ctx = ssl.create_default_context(cafile=ca if ca and os.path.exists(ca) else None)
+        self.tags: dict[str, int] = {}
+
+    def _req(self, method: str, path: str, body: bytes | None = None, ctype: str | None = None):
+        headers = {"Accept": "application/json; version=10", "Authorization": f"Token {self.token}"}
+        if ctype:
+            headers["Content-Type"] = ctype
+        req = urllib.request.Request(self.url + path, data=body, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=300, context=self.ctx) as r:
+                raw = r.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"HTTP {e.code} {e.read().decode(errors='replace')[:300]}") from None
+
+    def ping(self) -> None:
+        self._req("GET", "/api/tags/?page_size=1")
+
+    def tag_id(self, name: str) -> int:
+        key = name.strip()
+        if key in self.tags:
+            return self.tags[key]
+        res = self._req("GET", f"/api/tags/?name__iexact={urllib.parse.quote(key)}")
+        results = res.get("results", []) if isinstance(res, dict) else []
+        if results:
+            tid = int(results[0]["id"])
+        else:
+            created = self._req("POST", "/api/tags/", json.dumps({"name": key, "matching_algorithm": 0}).encode(), "application/json")
+            tid = int(created["id"])
+            log(f"created tag {key!r} (id={tid})")
+        self.tags[key] = tid
+        return tid
+
+    def upload(self, path: str, title: str, created: str | None, tag_ids: list[int]) -> str:
+        boundary = "----drivemigrate" + uuid.uuid4().hex
+        fields = [("title", title)] + [("tags", str(t)) for t in tag_ids]
+        if created:
+            fields.append(("created", created))
+        with open(path, "rb") as f:
+            data = f.read()
+        body = bytearray()
+        for k, v in fields:
+            body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode()
+        body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{os.path.basename(path)}\"\r\n"
+                 f"Content-Type: application/octet-stream\r\n\r\n").encode() + data + f"\r\n--{boundary}--\r\n".encode()
+        res = self._req("POST", "/api/documents/post_document/", bytes(body), f"multipart/form-data; boundary={boundary}")
+        return (res if isinstance(res, str) else str(res)).strip().strip('"')
+
+    def wait(self, task_id: str, timeout: float = 900) -> dict:
+        end = time.time() + timeout
+        while time.time() < end:
+            res = self._req("GET", f"/api/tasks/?task_id={urllib.parse.quote(task_id)}")
+            items = res if isinstance(res, list) else (res or {}).get("results", [])
+            if items:
+                st = str(items[0].get("status", "")).upper()
+                if st in ("SUCCESS", "FAILURE"):
+                    return items[0]
+            time.sleep(3)
+        return {"status": "TIMEOUT", "result": f"no final state after {timeout:.0f}s"}
+
+
+def read_secret(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except (FileNotFoundError, TypeError):
+        return ""
+
+
+# ── ledger ────────────────────────────────────────────────────────────────────
+def ledger_rows() -> list[dict]:
+    if not os.path.exists(LEDGER):
+        return []
+    with open(LEDGER, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def ledger_append(row: dict) -> None:
+    new = not os.path.exists(LEDGER)
+    with open(LEDGER, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=LEDGER_FIELDS)
+        if new:
+            w.writeheader()
+        w.writerow({k: row.get(k, "") for k in LEDGER_FIELDS})
+
+
+# ── commands ──────────────────────────────────────────────────────────────────
+def cmd_auth(a: argparse.Namespace) -> None:
+    need("rclone")
+    ensure_dirs()
+    cfg = load_config()
+    if a.what == "drive":
+        if not a.client_id or not a.client_secret:
+            die("--client-id and --client-secret are required (your own Google Cloud OAuth 'Desktop app' client, "
+                "project in Testing mode with you as a test user, scope drive.readonly)")
+        log("rclone will open the browser: sign in with the Google account that owns the Drive (read-only scope)")
+        rclone(cfg, ["config", "create", "gdrive", "drive", "scope=drive.readonly", f"client_id={a.client_id}",
+                     f"client_secret={a.client_secret}", "--non-interactive=false"], capture=False)
+        os.chmod(RCLONE_CONF, 0o600)
+        out = rclone(cfg, ["lsd", "--max-depth", "1", "gdrive:"], capture=True, check=False)
+        if out.returncode != 0:
+            die("rclone cannot list gdrive: — " + out.stderr.strip()[-300:])
+        log(f"Drive answers; top-level folders:\n{out.stdout.rstrip()}")
+    elif a.what == "opencloud":
+        if not a.user or not a.token:
+            die("--user and --token are required (OpenCloud app token: cn-opencloud/scripts/app-token.sh <user>)")
+        url = a.url.rstrip("/") + f"/remote.php/dav/files/{a.user}/"
+        if a.fetch_ca:
+            fetch_ca(cfg)
+        obscured = rclone(cfg, ["obscure", a.token], capture=True).stdout.strip()
+        rclone(cfg, ["config", "create", "opencloud", "webdav", f"url={url}", "vendor=infinitescale", f"user={a.user}",
+                     f"pass={obscured}", "--obscure=false", "--non-interactive"], capture=True)
+        os.chmod(RCLONE_CONF, 0o600)
+        cfg.update({"opencloud_url": a.url.rstrip("/"), "opencloud_user": a.user})
+        save_config(cfg)
+        out = rclone(cfg, ["lsd", "opencloud:"], capture=True, check=False)
+        if out.returncode != 0:
+            die("rclone cannot list opencloud: — " + out.stderr.strip()[-400:])
+        log(f"OpenCloud WebDAV answers as {a.user}; top-level folders:\n{out.stdout.rstrip() or '  (empty)'}")
+    elif a.what == "paperless":
+        if not a.token:
+            die("--token is required (a Paperless API token: My Profile → API token, or the scanner/importer user)")
+        if a.fetch_ca:
+            fetch_ca(cfg)
+        tf = os.path.join(CFG_DIR, "paperless.token")
+        with open(tf, "w") as f:
+            f.write(a.token.strip() + "\n")
+        os.chmod(tf, 0o600)
+        cfg.update({"paperless_url": a.url.rstrip("/"), "paperless_token_file": tf})
+        save_config(cfg)
+        Paperless(cfg).ping()
+        log(f"Paperless answers at {cfg['paperless_url']}")
+
+
+def fetch_ca(cfg: dict) -> None:
+    """The LAN names carry step-ca leaves; keep the homelab root next to the config."""
+    ca = os.path.join(CFG_DIR, "homelab-root-ca.crt")
+    if not os.path.exists(ca):
+        try:
+            with urllib.request.urlopen("http://pki.lan/cert/ca.crt", timeout=10) as r:
+                pem = r.read()
+            if b"BEGIN CERTIFICATE" not in pem:
+                raise ValueError("not a PEM certificate")
+            with open(ca, "wb") as f:
+                f.write(pem)
+            log(f"step-ca root saved to {ca}")
+        except Exception as e:  # noqa: BLE001
+            log(f"could not fetch the step-ca root from pki.lan ({e}); pass --no-fetch-ca or install the root yourself")
+            return
+    cfg["ca_cert"] = ca
+    save_config(cfg)
+
+
+def cmd_mirror(a: argparse.Namespace) -> None:
+    need("rclone")
+    cfg = load_config()
+    ensure_dirs()
+    dest = f"opencloud:{a.dest.strip('/')}/"
+    logf = os.path.join(LOGS, f"mirror-{dt.datetime.now():%Y%m%d-%H%M%S}.log")
+    args = ["copy", "gdrive:", dest, "--drive-export-formats", EXPORT_FORMATS, "--create-empty-src-dirs",
+            "--transfers", str(a.transfers), "--checkers", "8", "--stats", "30s", "--stats-one-line", "--progress",
+            "--log-level", "INFO", "--log-file", logf, "--retries", "5", "--low-level-retries", "20"]
+    if a.filter_from:
+        args += ["--filter-from", a.filter_from]
+    if a.dry_run:
+        args.append("--dry-run")
+    log(f"rclone copy gdrive: → {dest}{' (dry run)' if a.dry_run else ''}; log: {logf}")
+    r = rclone(cfg, args, capture=False, check=False)
+    if r.returncode != 0:
+        die(f"rclone copy exited {r.returncode} — read {logf}; re-run to resume")
+    log("mirror finished (re-run any time: only new or changed files move)")
+
+
+def cmd_verify(a: argparse.Namespace) -> None:
+    need("rclone")
+    cfg = load_config()
+    dest = f"opencloud:{a.dest.strip('/')}/"
+    log("checking regular files (one way, source → OpenCloud)…")
+    r = rclone(cfg, ["check", "gdrive:", dest, "--one-way", "--drive-skip-gdocs", "--size-only"], capture=True, check=False)
+    print(r.stderr.strip()[-2000:])
+    items = listing(cfg, "gdrive", refresh=False)
+    gdocs = [i for i in items if i.get("MimeType", "") in GDOC_EXPORT]
+    if gdocs:
+        log(f"checking {len(gdocs)} exported Google docs by name…")
+        have = set(json.loads(rclone(cfg, ["lsjson", "-R", "--files-only", dest], capture=True).stdout) and
+                   [x["Path"] for x in json.loads(rclone(cfg, ["lsjson", "-R", "--files-only", dest], capture=True).stdout)])
+        missing = [i["Path"] for i in gdocs if i["Path"] not in have]
+        print(f"exported Google docs present: {len(gdocs) - len(missing)}/{len(gdocs)}")
+        for m in missing[:50]:
+            print("  missing:", m)
+    sys.exit(0 if r.returncode == 0 else 1)
+
+
+def fzf_pick(items: list[dict], out: str) -> None:
+    need("fzf")
+    lines = []
+    for it in items:
+        size = it.get("Size", -1)
+        human = "gdoc" if size is None or size < 0 else f"{size/1048576:.1f}M" if size > 1048576 else f"{size/1024:.0f}K"
+        mod = (it.get("ModTime") or "")[:10]
+        lines.append(f"{it['Path']}\t{human}\t{mod}\t{it.get('MimeType','')}")
+    header = "TAB marks, ENTER confirms, ESC aborts · path · size · modified · mime"
+    proc = subprocess.run(["fzf", "--multi", "--delimiter", "\t", "--with-nth", "1,2,3", "--header", header,
+                           "--preview", "printf '%s\\n' {1} {2} {3} {4}", "--preview-window", "down,4,wrap",
+                           "--bind", "ctrl-a:select-all,ctrl-d:deselect-all"], input="\n".join(lines), text=True, capture_output=True)
+    if proc.returncode not in (0, 1):
+        die("fzf aborted")
+    picks = [ln.split("\t", 1)[0] for ln in proc.stdout.splitlines() if ln.strip()]
+    with open(out, "w") as f:
+        f.write("\n".join(picks) + ("\n" if picks else ""))
+    log(f"{len(picks)} file(s) selected → {out}")
+
+
+def cmd_pick(a: argparse.Namespace) -> None:
+    need("rclone")
+    cfg = load_config()
+    ensure_dirs()
+    items = listing(cfg, a.source, a.refresh)
+    out = a.out or os.path.join(CFG_DIR, f"selection-{dt.datetime.now():%Y%m%d-%H%M%S}.txt")
+    fzf_pick(items, out)
+
+
+def path_tags(path: str) -> list[str]:
+    parts = path.split("/")[:-1]
+    return [p.strip() for p in parts if p.strip()]
+
+
+def cmd_push(a: argparse.Namespace) -> None:
+    need("rclone")
+    cfg = load_config()
+    ensure_dirs()
+    with open(a.selection) as f:
+        picks = [ln.rstrip("\n") for ln in f if ln.strip() and not ln.startswith("#")]
+    items = {i["Path"]: i for i in listing(cfg, a.source, refresh=False)}
+    done = {r["path"] for r in ledger_rows() if r.get("status") == "success" and r.get("source") == a.source}
+    pl = None if a.dry_run else Paperless(cfg)
+    if pl:
+        pl.ping()
+    remote = source_remote(a.source)
+    tmp = tempfile.mkdtemp(prefix="drive-migrate-")
+    ok = skipped = failed = 0
+    try:
+        for path in picks:
+            if path in done:
+                skipped += 1
+                continue
+            it = items.get(path)
+            if not it:
+                log(f"skip (not in listing — run `pick --refresh`): {path}")
+                failed += 1
+                continue
+            name = os.path.basename(path)
+            title = os.path.splitext(name)[0]
+            created = ((it.get("Metadata") or {}).get("btime") or it.get("ModTime") or "")[:10] or None
+            tags = list(a.tag or ["gdrive-import"])
+            if a.tags_from_path:
+                tags += path_tags(path)
+            if a.dry_run:
+                print(f"would import: {path}  title={title!r} created={created} tags={tags}")
+                ok += 1
+                continue
+            local = os.path.join(tmp, name)
+            args = ["copyto", remote + path, local]
+            if a.source == "gdrive":
+                args += ["--drive-export-formats", EXPORT_FORMATS]
+            r = rclone(cfg, args, capture=True, check=False)
+            if r.returncode != 0 or not os.path.exists(local):
+                log(f"download failed: {path}: {r.stderr.strip()[-200:]}")
+                ledger_append({"ts": dt.datetime.now().isoformat(timespec="seconds"), "source": a.source, "path": path,
+                               "drive_id": it.get("ID", ""), "size": it.get("Size", ""), "modtime": it.get("ModTime", ""),
+                               "status": "download-failed", "note": r.stderr.strip()[-200:]})
+                failed += 1
+                continue
+            try:
+                tag_ids = [pl.tag_id(t) for t in tags]
+                task = pl.upload(local, title, created, tag_ids)
+                info = pl.wait(task)
+                status = str(info.get("status", "")).lower()
+                note = str(info.get("result", ""))[:200]
+                doc = info.get("related_document") or (re.search(r"document id (\d+)", note or "") or [None, ""])[1]
+                ledger_append({"ts": dt.datetime.now().isoformat(timespec="seconds"), "source": a.source, "path": path,
+                               "drive_id": it.get("ID", ""), "size": it.get("Size", ""), "modtime": it.get("ModTime", ""),
+                               "task_id": task, "status": status, "document_id": doc or "", "note": note})
+                if status == "success":
+                    ok += 1
+                    log(f"imported {path} → document {doc or '?'}")
+                else:
+                    failed += 1
+                    log(f"Paperless did not consume {path}: {status} {note}")
+            except Exception as e:  # noqa: BLE001
+                failed += 1
+                log(f"upload failed: {path}: {e}")
+                ledger_append({"ts": dt.datetime.now().isoformat(timespec="seconds"), "source": a.source, "path": path,
+                               "drive_id": it.get("ID", ""), "status": "upload-failed", "note": str(e)[:200]})
+            finally:
+                try:
+                    os.remove(local)
+                except OSError:
+                    pass
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    log(f"done: {ok} imported, {skipped} already done, {failed} failed{' (dry run)' if a.dry_run else ''}")
+    sys.exit(1 if failed else 0)
+
+
+def cmd_status(_: argparse.Namespace) -> None:
+    rows = ledger_rows()
+    by = {}
+    for r in rows:
+        by[r["status"]] = by.get(r["status"], 0) + 1
+    print(f"ledger: {LEDGER} ({len(rows)} rows)")
+    for k, v in sorted(by.items()):
+        print(f"  {k:16s} {v}")
+    cfg = load_config()
+    print("config:", json.dumps({k: v for k, v in cfg.items() if "token" not in k}, indent=2))
+    print("rclone remotes:", subprocess.run(["rclone", "--config", RCLONE_CONF, "listremotes"], capture_output=True, text=True).stdout.split())
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="drive-migrate", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    pa = sub.add_parser("auth"); pa.add_argument("what", choices=["drive", "opencloud", "paperless"])
+    pa.add_argument("--client-id"); pa.add_argument("--client-secret"); pa.add_argument("--user"); pa.add_argument("--token")
+    pa.add_argument("--url", default=None); pa.add_argument("--no-fetch-ca", dest="fetch_ca", action="store_false")
+    pa.set_defaults(func=cmd_auth)
+    pm = sub.add_parser("mirror"); pm.add_argument("--dest", default="Google Drive"); pm.add_argument("--dry-run", action="store_true")
+    pm.add_argument("--filter-from"); pm.add_argument("--transfers", type=int, default=4); pm.set_defaults(func=cmd_mirror)
+    pv = sub.add_parser("verify"); pv.add_argument("--dest", default="Google Drive"); pv.set_defaults(func=cmd_verify)
+    pp = sub.add_parser("pick"); pp.add_argument("--refresh", action="store_true"); pp.add_argument("--source", default="gdrive")
+    pp.add_argument("--out"); pp.set_defaults(func=cmd_pick)
+    pu = sub.add_parser("push"); pu.add_argument("--selection", required=True); pu.add_argument("--tags-from-path", action="store_true")
+    pu.add_argument("--tag", action="append"); pu.add_argument("--dry-run", action="store_true"); pu.add_argument("--source", default="gdrive")
+    pu.set_defaults(func=cmd_push)
+    ps = sub.add_parser("status"); ps.set_defaults(func=cmd_status)
+    a = p.parse_args()
+    if a.cmd == "auth" and a.url is None:
+        a.url = {"drive": "", "opencloud": "https://drive.lab.gn.al", "paperless": "https://docs.lab.gn.al"}[a.what]
+    a.func(a)
+
+
+if __name__ == "__main__":
+    main()

@@ -52,6 +52,23 @@ Store `config/opencloud/opencloud.yaml` in Kauket right after the first run (the
 | rclone | `type=webdav`, `vendor=infinitescale`, `url=…/remote.php/dav/files/<user>/`, `user`, `pass=<app token>` | TUS chunked uploads (10 MB); rclone ≥ 1.75 |
 | Desktop / iOS / Android | not yet — see follow-ups | the native clients use three more OIDC clients and a global issuer |
 
+## Leaving Google Drive — `tools/drive-migrate`
+
+A stdlib Python CLI (plus `rclone` ≥ 1.75 and `fzf`) that runs on the operator Mac at home; state in `~/.config/drive-migrate/` (0700, nothing in Git). Google side, once: your **own** Google Cloud project with the Drive API enabled, an OAuth *Desktop app* client, scope `drive.readonly`, consent screen in *Testing* with you as test user (a restricted scope in a published app would need Google verification; in Testing the grant expires after 7 days — just re-run `auth drive`). Keep it separate from cn-printer's `drive.file` client.
+
+```sh
+tools/drive-migrate/drive-migrate auth drive --client-id … --client-secret …   # browser consent, read-only
+tools/drive-migrate/drive-migrate auth opencloud --user gonzalo --token "$(ssh kaiser.lan ~/cn-opencloud/scripts/app-token.sh gonzalo)"
+tools/drive-migrate/drive-migrate auth paperless --token <API token>          # a Paperless user's token (My Profile)
+tools/drive-migrate/drive-migrate mirror --dry-run && tools/drive-migrate/drive-migrate mirror   # whole tree → OpenCloud "Google Drive/"
+tools/drive-migrate/drive-migrate verify
+tools/drive-migrate/drive-migrate pick                                        # fzf multi-select → selection file
+tools/drive-migrate/drive-migrate push --selection ~/.config/drive-migrate/selection-*.txt --tags-from-path
+tools/drive-migrate/drive-migrate status
+```
+
+`mirror` is a resumable `rclone copy` (Docs/Sheets/Slides exported as docx/xlsx/pptx, folders kept, re-runs move only changes); `push` downloads each pick, POSTs it to Paperless with the title, the Drive creation date and tags `gdrive-import` + every folder of its path, waits for the consumption task and records it in `ledger.csv` — re-runs skip successes (Paperless 3 accepts duplicates, so the ledger is the guard). `--source takeout:/path/to/extracted/Takeout/Drive` uses a Google Takeout export instead of the live Drive (no OAuth). The self-test `tools/drive-migrate/test` uses rclone `alias` remotes and a fake Paperless API. The operator must have logged into OpenCloud once (autoprovisioning) before an app token can be minted for them.
+
 ## Identity
 
 - Groups are capabilities: Authentik `drive` → user, `infra-admins` → admin. The mapping is a claim, evaluated at every login; the first login autoprovisions the account in the built-in idm (username = Authentik username, e-mail + display name copied).
