@@ -48,7 +48,7 @@ Store `config/opencloud/opencloud.yaml` in Kauket right after the first run (the
 |---|---|---|
 | Web UI | **`https://drive.lab.gn.al`** | Authentik login (`drive` or `infra-admins`) |
 | LAN alias | `https://drive.kaiser.lan` | 301 to the canonical name |
-| WebDAV | `https://drive.lab.gn.al/remote.php/dav/files/<user>/` (or `/remote.php/dav/spaces/<space-id>/`) | username + **app token** (`scripts/app-token.sh <user>` or Account → App tokens); basic auth with the password is off |
+| WebDAV | `https://drive.lab.gn.al/remote.php/dav/files/<user>/` (or `/remote.php/dav/spaces/<space-id>/`) | username + **app token** (`scripts/app-token.sh <user>` or Account → App tokens; the token is a six-word passphrase); basic auth with the password is off. The operator's account is `akadmin` (the Authentik username). |
 | rclone | `type=webdav`, `vendor=infinitescale`, `url=…/remote.php/dav/files/<user>/`, `user`, `pass=<app token>` | TUS chunked uploads (10 MB); rclone ≥ 1.75 |
 | Desktop / iOS / Android | not yet — see follow-ups | the native clients use three more OIDC clients and a global issuer |
 
@@ -93,6 +93,9 @@ VPS plane: jobs `opencloud-node` (`drive.ts.gn.al:9400` — 9100 belongs to Open
 Health first: `docker compose ps` · `curl -s https://drive.lab.gn.al/status.php` · `docker compose logs --tail=100 opencloud` (JSON lines) · `docker compose exec opencloud opencloud posixfs consistency`.
 
 ## Gotchas
+
+- **A crash-looping first start leaves half-initialised state.** On 2026-11-07 the `web` port clash made the supervisor restart services for minutes; afterwards `data/search/bleve` held an unreadable index ("error parsing mapping JSON") and `data/idm/idm.boltdb` lacked the service users (`uid=reva`/`uid=libregraph` bind → "not found", every OIDC login died with "Autoprovisioning user failed"). On an instance with no users yet: stop, remove/rename those two, start — idm and search re-bootstrap from the env/`opencloud.yaml`. Never do this on an instance that already has users (idm holds them).
+- **App tokens are passphrases** ("word word word …"): treat any log that prints `token:` as a leak; revoke via `DELETE /auth-app/tokens?token=…` (see `scripts/app-token.sh`).
 
 - **Never `opencloud init --force-overwrite`**: it regenerates the secrets and the storage mount id baked into every space id. `init --diff` + `patch` is the upgrade path.
 - **`/etc/opencloud` must be writable by uid 1000** (the init step writes there); `setup.sh` creates both dirs with that owner.
