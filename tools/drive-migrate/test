@@ -48,6 +48,9 @@ check "verify passes" "$DM" verify
 check "second mirror is a no-op (nothing transferred)" bash -c "$DM mirror 2>&1 | grep -q 'mirror finished' && diff -r '$T/drive' '$T/cloud/Google Drive'"
 printf 'Finance/2024/invoice.pdf\nFinance/2024/receipt.pdf\nNotes/Ideas/todo.txt\n' > "$T/sel.txt"
 check "pick listing can be built (lsjson cache)" bash -c "$DM push --selection '$T/sel.txt' --dry-run >/dev/null; ls '$DRIVE_MIGRATE_HOME'/listing-gdrive.json"
+check "pick --print offers PDFs only by default (2 of 4)" bash -c "$DM pick --print | sort | diff - <(printf 'Finance/2024/invoice.pdf\nFinance/2024/receipt.pdf\n')"
+check "pick --ext all --under Notes narrows by folder" bash -c "$DM pick --print --ext all --under Notes | diff - <(printf 'Notes/Ideas/todo.txt\n')"
+check "pick --ext jpg,txt widens the set" bash -c "[ \"\$($DM pick --print --ext jpg,txt | wc -l | tr -d ' ')\" = 2 ]"
 check "push --dry-run uploads nothing" bash -c "[ -z \"\$(ls -A '$T/pl-out')\" ] && ! [ -f '$DRIVE_MIGRATE_HOME/ledger.csv' ]"
 set +e; "$DM" push --selection "$T/sel.txt" --tags-from-path >"$T/push.log" 2>&1; rc=$?; set -e
 check "push exits 1 when one file is rejected" test "$rc" -eq 1

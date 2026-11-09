@@ -15,8 +15,9 @@ at home; stdlib + rclone + fzf. State lives in ~/.config/drive-migrate (0700).
         exported as docx/xlsx/pptx; re-runs copy only what changed)
   drive-migrate verify [--dest "Google Drive"]
         rclone check (one way) for regular files + name check for exported Google docs
-  drive-migrate pick [--refresh] [--source gdrive|takeout:/path] [--out FILE]
-        fzf multi-select over the cached listing → a selection file
+  drive-migrate pick [--ext pdf] [--under FOLDER] [--print] [--refresh] [--source …] [--out FILE]
+        fzf multi-select over the cached listing → a selection file; PDFs only by
+        default (--ext pdf,docx,jpg … or --ext all), optionally below one folder
   drive-migrate push --selection FILE [--tags-from-path] [--tag NAME]... [--dry-run] [--source ...]
         download each pick, POST it to Paperless (title, created, tags), wait for
         the task, record it in the ledger; re-runs skip what already succeeded
@@ -418,13 +419,37 @@ def fzf_pick(items: list[dict], out: str) -> None:
     log(f"{len(picks)} file(s) selected → {out}")
 
 
+def filter_items(items: list[dict], ext: str, under: str | None) -> list[dict]:
+    """Keep files whose extension is in `ext` (comma list, "all" = everything)
+    and, when given, whose path starts with `under` (a Drive folder prefix)."""
+    exts = None if ext.strip().lower() == "all" else {"." + e.strip().lower().lstrip(".") for e in ext.split(",") if e.strip()}
+    prefix = (under or "").strip("/")
+    out = []
+    for it in items:
+        path = it["Path"]
+        if prefix and not (path == prefix or path.startswith(prefix + "/")):
+            continue
+        if exts is not None and os.path.splitext(path)[1].lower() not in exts:
+            continue
+        out.append(it)
+    return out
+
+
 def cmd_pick(a: argparse.Namespace) -> None:
     need("rclone")
     cfg = load_config()
     ensure_dirs()
     items = listing(cfg, a.source, a.refresh)
+    picked = filter_items(items, a.ext, a.under)
+    log(f"{len(picked)} of {len(items)} files match ext={a.ext}" + (f" under={a.under}" if a.under else ""))
+    if not picked:
+        die("nothing to pick — widen --ext (e.g. --ext pdf,docx,jpg or --ext all) or drop --under")
+    if a.print_only:
+        for it in picked:
+            print(it["Path"])
+        return
     out = a.out or os.path.join(CFG_DIR, f"selection-{dt.datetime.now():%Y%m%d-%H%M%S}.txt")
-    fzf_pick(items, out)
+    fzf_pick(picked, out)
 
 
 def path_tags(path: str) -> list[str]:
@@ -535,7 +560,11 @@ def main() -> None:
     pm.add_argument("--filter-from"); pm.add_argument("--transfers", type=int, default=4); pm.set_defaults(func=cmd_mirror)
     pv = sub.add_parser("verify"); pv.add_argument("--dest", default="Google Drive"); pv.set_defaults(func=cmd_verify)
     pp = sub.add_parser("pick"); pp.add_argument("--refresh", action="store_true"); pp.add_argument("--source", default="gdrive")
-    pp.add_argument("--out"); pp.set_defaults(func=cmd_pick)
+    pp.add_argument("--out")
+    pp.add_argument("--ext", default="pdf", help="comma list of extensions to offer (default pdf; 'all' for everything)")
+    pp.add_argument("--under", help="only files below this Drive folder, e.g. 'Scanned' or 'Finance/2024'")
+    pp.add_argument("--print", dest="print_only", action="store_true", help="print the filtered paths instead of opening fzf")
+    pp.set_defaults(func=cmd_pick)
     pu = sub.add_parser("push"); pu.add_argument("--selection", required=True); pu.add_argument("--tags-from-path", action="store_true")
     pu.add_argument("--tag", action="append"); pu.add_argument("--dry-run", action="store_true"); pu.add_argument("--source", default="gdrive")
     pu.set_defaults(func=cmd_push)

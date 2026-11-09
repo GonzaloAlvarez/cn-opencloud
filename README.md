@@ -62,7 +62,7 @@ tools/drive-migrate/drive-migrate auth opencloud --user gonzalo --token "$(ssh k
 tools/drive-migrate/drive-migrate auth paperless --token <API token>          # a Paperless user's token (My Profile)
 tools/drive-migrate/drive-migrate mirror --dry-run && tools/drive-migrate/drive-migrate mirror   # whole tree → OpenCloud "Google Drive/"
 tools/drive-migrate/drive-migrate verify
-tools/drive-migrate/drive-migrate pick                                        # fzf multi-select → selection file
+tools/drive-migrate/drive-migrate pick                                        # fzf multi-select → selection file (PDFs only by default; --ext pdf,docx or --ext all; --under Scanned)
 tools/drive-migrate/drive-migrate push --selection ~/.config/drive-migrate/selection-*.txt --tags-from-path
 tools/drive-migrate/drive-migrate status
 ```
