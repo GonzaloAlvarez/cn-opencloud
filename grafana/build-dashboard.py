@@ -157,8 +157,7 @@ def build():
     p.append(ts(33, "OpenCloud process memory (RSS)", [q('process_resident_memory_bytes{job="opencloud"}', "rss")], 8, y, 8, 4, unit="bytes", min_=0))
     p.append(ts(34, "Goroutines", [q('go_goroutines{job="opencloud"}', "goroutines")], 16, y, 8, 4, min_=0))
     y += 4
-    p.append(ts(35, "Data volume used on kaiser (/, SSD)", [q('(1 - node_filesystem_avail_bytes{job="opencloud-node",mountpoint="/rootfs"} / node_filesystem_size_bytes{job="opencloud-node",mountpoint="/rootfs"}) * 100', "/ %"),
-                                                          q('(1 - node_filesystem_avail_bytes{job="opencloud-node",mountpoint="/"} / node_filesystem_size_bytes{job="opencloud-node",mountpoint="/"}) * 100', "/ %", ref="B")], 0, y, 12, 6, unit="percent", min_=0, max_=100))
+    p.append(ts(35, "Data volume used on kaiser (/, SSD — the PosixFS tree lives there)", [q('(1 - node_filesystem_avail_bytes{job="opencloud-node",mountpoint="/"} / node_filesystem_size_bytes{job="opencloud-node",mountpoint="/"}) * 100', "/ %")], 0, y, 12, 6, unit="percent", min_=0, max_=100))
     p.append(ts(36, "kaiser CPU (seen from the stack's node-exporter)", [q('(1 - avg(rate(node_cpu_seconds_total{job="opencloud-node",mode="idle"}[5m]))) * 100', "cpu %")], 12, y, 12, 6, unit="percent", min_=0, max_=100))
     y += 6
     p.append(row(40, "Logs (VPS Loki, stack=cn-opencloud)", y)); y += 1
