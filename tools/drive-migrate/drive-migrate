@@ -496,11 +496,21 @@ def path_tags(path: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+def task_result(info: dict) -> tuple[str, str]:
+    """(note, document id) from a Paperless task — 3.4 exposes result_data and
+    related_document_ids, older releases result and related_document."""
+    note = str(info.get("result_data") or info.get("result") or "")[:200]
+    ids = info.get("related_document_ids") or []
+    doc = str(ids[0]) if ids else (info.get("related_document") or "")
+    if not doc:
+        m = re.search(r"document id (\d+)", note)
+        doc = m.group(1) if m else ""
+    return note, str(doc)
+
+
 def finish_row(row: dict, info: dict) -> dict:
-    status = str(info.get("status", "")).lower()
-    note = str(info.get("result", ""))[:200]
-    m = re.search(r"document id (\d+)", note)
-    row.update({"status": status, "note": note, "document_id": info.get("related_document") or (m.group(1) if m else "")})
+    note, doc = task_result(info)
+    row.update({"status": str(info.get("status", "")).lower(), "note": note, "document_id": doc})
     return row
 
 
