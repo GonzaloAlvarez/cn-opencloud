@@ -27,6 +27,7 @@ class State:
     def __init__(self, out_dir, token, fail_names):
         self.out_dir, self.token, self.fail_names = out_dir, token, set(fail_names)
         self.tasks, self.tags, self.docs = {}, {}, 0
+        self.storage_paths, self.storage_path_templates = {}, {}
         self.lock = threading.Lock()
 
 
@@ -67,6 +68,11 @@ def make_handler(state: State):
                         tid = state.tags.get(name.lower())
                     return self._json(200, {"results": [{"id": tid, "name": name}] if tid else []})
                 return self._json(200, {"results": [{"id": i, "name": n} for n, i in state.tags.items()][:1]})
+            if u.path == "/api/storage_paths/":
+                name = (q.get("name__iexact") or [""])[0]
+                with state.lock:
+                    sid = state.storage_paths.get(name.lower()) if name else None
+                return self._json(200, {"results": [{"id": sid, "name": name}] if sid else []})
             if u.path == "/api/":
                 return self._json(200, {"documents": "/api/documents/"})
             self._json(404, {"detail": "not found"})
@@ -82,6 +88,12 @@ def make_handler(state: State):
                 with state.lock:
                     tid = state.tags.setdefault(name.lower(), len(state.tags) + 1)
                 return self._json(201, {"id": tid, "name": name})
+            if u.path == "/api/storage_paths/":
+                body = json.loads(raw or b"{}")
+                with state.lock:
+                    sid = state.storage_paths.setdefault(body.get("name", "").lower(), len(state.storage_paths) + 1)
+                    state.storage_path_templates[body.get("name", "")] = body.get("path", "")
+                return self._json(201, {"id": sid, **body})
             if u.path == "/api/documents/post_document/":
                 ctype = self.headers.get("Content-Type", "")
                 msg = BytesParser(policy=email_policy).parsebytes(

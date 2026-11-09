@@ -18,9 +18,12 @@ at home; stdlib + rclone + fzf. State lives in ~/.config/drive-migrate (0700).
   drive-migrate pick [--ext pdf] [--under FOLDER] [--print] [--refresh] [--source …] [--out FILE]
         fzf multi-select over the cached listing → a selection file; PDFs only by
         default (--ext pdf,docx,jpg … or --ext all), optionally below one folder
-  drive-migrate push --selection FILE [--tags-from-path] [--tag NAME]... [--dry-run] [--source ...]
-        download each pick, POST it to Paperless (title, created, tags), wait for
-        the task, record it in the ledger; re-runs skip what already succeeded
+  drive-migrate push --selection FILE [--tags-from-path] [--tag NAME]... [--no-folders] [--root NAME] [--wait] [--dry-run]
+        download each pick, POST it to Paperless (title, created, tags, and a
+        storage path mirroring its Drive folder: <root>/<folder>/<title> on the
+        media tree), record the task in the ledger; re-runs skip what is done
+  drive-migrate settle
+        poll the queued tasks until Paperless reports success/failure
   drive-migrate status
 """
 from __future__ import annotations
@@ -161,6 +164,7 @@ class Paperless:
         ca = cfg.get("ca_cert")
         self.ctx = ssl.create_default_context(cafile=ca if ca and os.path.exists(ca) else None)
         self.tags: dict[str, int] = {}
+        self.storage_paths: dict[str, int] = {}
 
     def _req(self, method: str, path: str, body: bytes | None = None, ctype: str | None = None):
         headers = {"Accept": "application/json; version=10", "Authorization": f"Token {self.token}"}
@@ -192,11 +196,38 @@ class Paperless:
         self.tags[key] = tid
         return tid
 
-    def upload(self, path: str, title: str, created: str | None, tag_ids: list[int]) -> str:
+    def storage_path_id(self, folder: str, root: str) -> int | None:
+        """One Paperless storage path per Drive folder: documents land under
+        <root>/<folder>/<title> on the media tree, and the folder is filterable."""
+        rel = folder.strip("/")
+        name = f"{root}/{rel}" if rel else root
+        if name in self.storage_paths:
+            return self.storage_paths[name]
+        res = self._req("GET", f"/api/storage_paths/?name__iexact={urllib.parse.quote(name)}")
+        results = res.get("results", []) if isinstance(res, dict) else []
+        if results:
+            sid = int(results[0]["id"])
+        else:
+            tmpl = name + "/{{ title }}"
+            created = self._req("POST", "/api/storage_paths/",
+                                json.dumps({"name": name, "path": tmpl, "matching_algorithm": 0}).encode(), "application/json")
+            sid = int(created["id"])
+            log(f"created storage path {name!r} (id={sid})")
+        self.storage_paths[name] = sid
+        return sid
+
+    def task_state(self, task_id: str) -> dict | None:
+        res = self._req("GET", f"/api/tasks/?task_id={urllib.parse.quote(task_id)}")
+        items = res if isinstance(res, list) else (res or {}).get("results", [])
+        return items[0] if items else None
+
+    def upload(self, path: str, title: str, created: str | None, tag_ids: list[int], storage_path: int | None = None) -> str:
         boundary = "----drivemigrate" + uuid.uuid4().hex
         fields = [("title", title)] + [("tags", str(t)) for t in tag_ids]
         if created:
             fields.append(("created", created))
+        if storage_path is not None:
+            fields.append(("storage_path", str(storage_path)))
         with open(path, "rb") as f:
             data = f.read()
         body = bytearray()
@@ -210,12 +241,9 @@ class Paperless:
     def wait(self, task_id: str, timeout: float = 900) -> dict:
         end = time.time() + timeout
         while time.time() < end:
-            res = self._req("GET", f"/api/tasks/?task_id={urllib.parse.quote(task_id)}")
-            items = res if isinstance(res, list) else (res or {}).get("results", [])
-            if items:
-                st = str(items[0].get("status", "")).upper()
-                if st in ("SUCCESS", "FAILURE"):
-                    return items[0]
+            info = self.task_state(task_id)
+            if info and str(info.get("status", "")).upper() in ("SUCCESS", "FAILURE"):
+                return info
             time.sleep(3)
         return {"status": "TIMEOUT", "result": f"no final state after {timeout:.0f}s"}
 
@@ -234,6 +262,16 @@ def ledger_rows() -> list[dict]:
         return []
     with open(LEDGER, newline="") as f:
         return list(csv.DictReader(f))
+
+
+def ledger_write(rows: list[dict]) -> None:
+    tmp = LEDGER + ".tmp"
+    with open(tmp, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=LEDGER_FIELDS)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in LEDGER_FIELDS})
+    os.replace(tmp, LEDGER)
 
 
 def ledger_append(row: dict) -> None:
@@ -458,6 +496,14 @@ def path_tags(path: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+def finish_row(row: dict, info: dict) -> dict:
+    status = str(info.get("status", "")).lower()
+    note = str(info.get("result", ""))[:200]
+    m = re.search(r"document id (\d+)", note)
+    row.update({"status": status, "note": note, "document_id": info.get("related_document") or (m.group(1) if m else "")})
+    return row
+
+
 def cmd_push(a: argparse.Namespace) -> None:
     need("rclone")
     cfg = load_config()
@@ -465,7 +511,7 @@ def cmd_push(a: argparse.Namespace) -> None:
     with open(a.selection) as f:
         picks = [ln.rstrip("\n") for ln in f if ln.strip() and not ln.startswith("#")]
     items = {i["Path"]: i for i in listing(cfg, a.source, refresh=False)}
-    done = {r["path"] for r in ledger_rows() if r.get("status") == "success" and r.get("source") == a.source}
+    done = {r["path"] for r in ledger_rows() if r.get("status") in ("success", "queued") and r.get("source") == a.source}
     pl = None if a.dry_run else Paperless(cfg)
     if pl:
         pl.ping()
@@ -473,7 +519,7 @@ def cmd_push(a: argparse.Namespace) -> None:
     tmp = tempfile.mkdtemp(prefix="drive-migrate-")
     ok = skipped = failed = 0
     try:
-        for path in picks:
+        for n, path in enumerate(picks, 1):
             if path in done:
                 skipped += 1
                 continue
@@ -483,13 +529,15 @@ def cmd_push(a: argparse.Namespace) -> None:
                 failed += 1
                 continue
             name = os.path.basename(path)
+            folder = os.path.dirname(path)
             title = os.path.splitext(name)[0]
             created = ((it.get("Metadata") or {}).get("btime") or it.get("ModTime") or "")[:10] or None
             tags = list(a.tag or ["gdrive-import"])
             if a.tags_from_path:
                 tags += path_tags(path)
+            where = f"{a.root}/{folder}" if folder else a.root
             if a.dry_run:
-                print(f"would import: {path}  title={title!r} created={created} tags={tags}")
+                print(f"would import: {path}  title={title!r} created={created} tags={tags} storage_path={where if a.keep_folders else '-'}")
                 ok += 1
                 continue
             local = os.path.join(tmp, name)
@@ -497,34 +545,34 @@ def cmd_push(a: argparse.Namespace) -> None:
             if a.source == "gdrive":
                 args += ["--drive-export-formats", EXPORT_FORMATS]
             r = rclone(cfg, args, capture=True, check=False)
+            base = {"ts": dt.datetime.now().isoformat(timespec="seconds"), "source": a.source, "path": path,
+                    "drive_id": it.get("ID", ""), "size": it.get("Size", ""), "modtime": it.get("ModTime", "")}
             if r.returncode != 0 or not os.path.exists(local):
-                log(f"download failed: {path}: {r.stderr.strip()[-200:]}")
-                ledger_append({"ts": dt.datetime.now().isoformat(timespec="seconds"), "source": a.source, "path": path,
-                               "drive_id": it.get("ID", ""), "size": it.get("Size", ""), "modtime": it.get("ModTime", ""),
-                               "status": "download-failed", "note": r.stderr.strip()[-200:]})
+                log(f"[{n}/{len(picks)}] download failed: {path}: {r.stderr.strip()[-200:]}")
+                ledger_append({**base, "status": "download-failed", "note": r.stderr.strip()[-200:]})
                 failed += 1
                 continue
             try:
                 tag_ids = [pl.tag_id(t) for t in tags]
-                task = pl.upload(local, title, created, tag_ids)
-                info = pl.wait(task)
-                status = str(info.get("status", "")).lower()
-                note = str(info.get("result", ""))[:200]
-                doc = info.get("related_document") or (re.search(r"document id (\d+)", note or "") or [None, ""])[1]
-                ledger_append({"ts": dt.datetime.now().isoformat(timespec="seconds"), "source": a.source, "path": path,
-                               "drive_id": it.get("ID", ""), "size": it.get("Size", ""), "modtime": it.get("ModTime", ""),
-                               "task_id": task, "status": status, "document_id": doc or "", "note": note})
-                if status == "success":
-                    ok += 1
-                    log(f"imported {path} → document {doc or '?'}")
+                sp = pl.storage_path_id(folder, a.root) if a.keep_folders else None
+                task = pl.upload(local, title, created, tag_ids, sp)
+                row = {**base, "task_id": task, "status": "queued", "note": ""}
+                if a.wait:
+                    row = finish_row(row, pl.wait(task))
+                    if row["status"] == "success":
+                        ok += 1
+                        log(f"[{n}/{len(picks)}] imported {path} → document {row['document_id'] or '?'}")
+                    else:
+                        failed += 1
+                        log(f"[{n}/{len(picks)}] Paperless did not consume {path}: {row['status']} {row['note']}")
                 else:
-                    failed += 1
-                    log(f"Paperless did not consume {path}: {status} {note}")
+                    ok += 1
+                    log(f"[{n}/{len(picks)}] queued {path} → task {task[:8]}…")
+                ledger_append(row)
             except Exception as e:  # noqa: BLE001
                 failed += 1
-                log(f"upload failed: {path}: {e}")
-                ledger_append({"ts": dt.datetime.now().isoformat(timespec="seconds"), "source": a.source, "path": path,
-                               "drive_id": it.get("ID", ""), "status": "upload-failed", "note": str(e)[:200]})
+                log(f"[{n}/{len(picks)}] upload failed: {path}: {e}")
+                ledger_append({**base, "status": "upload-failed", "note": str(e)[:200]})
             finally:
                 try:
                     os.remove(local)
@@ -532,8 +580,45 @@ def cmd_push(a: argparse.Namespace) -> None:
                     pass
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    log(f"done: {ok} imported, {skipped} already done, {failed} failed{' (dry run)' if a.dry_run else ''}")
+    verb = "imported" if a.wait else "queued"
+    log(f"done: {ok} {verb}, {skipped} already done/queued, {failed} failed{' (dry run)' if a.dry_run else ''}"
+        + ("" if a.wait or a.dry_run else " — run `drive-migrate settle` to collect the consumption results"))
     sys.exit(1 if failed else 0)
+
+
+def cmd_settle(a: argparse.Namespace) -> None:
+    """Poll every `queued` ledger row until Paperless reports success/failure."""
+    cfg = load_config()
+    pl = Paperless(cfg)
+    rows = ledger_rows()
+    queued = [r for r in rows if r.get("status") == "queued" and r.get("task_id")]
+    if not queued:
+        log("nothing queued")
+        return
+    log(f"{len(queued)} queued task(s); polling every {a.interval}s (Ctrl-C to stop; re-run any time)")
+    deadline = time.time() + a.timeout
+    while queued and time.time() < deadline:
+        still = []
+        for r in queued:
+            info = pl.task_state(r["task_id"])
+            st = str((info or {}).get("status", "")).upper()
+            if info is None:
+                r.update({"status": "vanished", "note": "task not found in Paperless"})
+            elif st in ("SUCCESS", "FAILURE"):
+                finish_row(r, info)
+                log(f"{r['status']}: {r['path']}" + (f" → document {r['document_id']}" if r['document_id'] else f" ({r['note'][:80]})"))
+            else:
+                still.append(r)
+        ledger_write(rows)
+        queued = still
+        if queued:
+            time.sleep(a.interval)
+    by = {}
+    for r in rows:
+        by[r["status"]] = by.get(r["status"], 0) + 1
+    log("ledger now: " + ", ".join(f"{k}={v}" for k, v in sorted(by.items())))
+    if queued:
+        log(f"{len(queued)} still queued — Paperless is still consuming; run settle again later")
 
 
 def cmd_status(_: argparse.Namespace) -> None:
@@ -568,7 +653,13 @@ def main() -> None:
     pp.set_defaults(func=cmd_pick)
     pu = sub.add_parser("push"); pu.add_argument("--selection", required=True); pu.add_argument("--tags-from-path", action="store_true")
     pu.add_argument("--tag", action="append"); pu.add_argument("--dry-run", action="store_true"); pu.add_argument("--source", default="gdrive")
+    pu.add_argument("--no-folders", dest="keep_folders", action="store_false",
+                    help="do not mirror the Drive folder as a Paperless storage path (default: <root>/<folder>/<title>)")
+    pu.add_argument("--root", default="Google Drive", help="storage-path prefix on the media tree (default 'Google Drive')")
+    pu.add_argument("--wait", action="store_true", help="wait for each consumption task instead of queueing (slow)")
     pu.set_defaults(func=cmd_push)
+    pt = sub.add_parser("settle"); pt.add_argument("--interval", type=float, default=10); pt.add_argument("--timeout", type=float, default=6 * 3600)
+    pt.set_defaults(func=cmd_settle)
     ps = sub.add_parser("status"); ps.set_defaults(func=cmd_status)
     a = p.parse_args()
     if a.cmd == "auth" and a.url is None:

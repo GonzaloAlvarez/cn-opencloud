@@ -52,13 +52,15 @@ check "pick --print offers PDFs only by default (2 of 4)" bash -c "$DM pick --pr
 check "pick --ext all --under Notes narrows by folder" bash -c "$DM pick --print --ext all --under Notes | diff - <(printf 'Notes/Ideas/todo.txt\n')"
 check "pick --ext jpg,txt widens the set" bash -c "[ \"\$($DM pick --print --ext jpg,txt | wc -l | tr -d ' ')\" = 2 ]"
 check "push --dry-run uploads nothing" bash -c "[ -z \"\$(ls -A '$T/pl-out')\" ] && ! [ -f '$DRIVE_MIGRATE_HOME/ledger.csv' ]"
-set +e; "$DM" push --selection "$T/sel.txt" --tags-from-path >"$T/push.log" 2>&1; rc=$?; set -e
-check "push exits 1 when one file is rejected" test "$rc" -eq 1
-check "two files reached Paperless, the rejected one too (fake saves then fails)" bash -c "[ -f '$T/pl-out/invoice.pdf' ] && [ -f '$T/pl-out/todo.txt' ]"
-check "ledger: 2 success + 1 failure" bash -c "grep -c ',success,' '$DRIVE_MIGRATE_HOME/ledger.csv' | grep -qx 2 && grep -c ',failure,' '$DRIVE_MIGRATE_HOME/ledger.csv' | grep -qx 1"
+check "push queues all three (exit 0)" bash -c "$DM push --selection '$T/sel.txt' --tags-from-path >'$T/push.log' 2>&1 && grep -q '3 queued, 0 already done/queued, 0 failed' '$T/push.log'"
+check "all three reached Paperless (the fake saves even the one it rejects)" bash -c "[ -f '$T/pl-out/invoice.pdf' ] && [ -f '$T/pl-out/receipt.pdf' ] && [ -f '$T/pl-out/todo.txt' ]"
+check "ledger: 3 queued before settle" bash -c "grep -c ',queued,' '$DRIVE_MIGRATE_HOME/ledger.csv' | grep -qx 3"
+check "settle resolves them: 2 success + 1 failure" bash -c "$DM settle --interval 0.2 >'$T/settle.log' 2>&1; grep -c ',success,' '$DRIVE_MIGRATE_HOME/ledger.csv' | grep -qx 2 && grep -c ',failure,' '$DRIVE_MIGRATE_HOME/ledger.csv' | grep -qx 1"
 check "tags from path were created (gdrive-import, Finance, 2024, Notes, Ideas)" bash -c "grep -c -E 'POST /api/tags/' '$T/fake.log' | grep -qx 5"
+check "storage paths mirror the Drive folders (Google Drive/Finance/2024, Google Drive/Notes/Ideas)" bash -c "grep -c -E 'POST /api/storage_paths/' '$T/fake.log' | grep -qx 2"
+check "push --wait on a fresh file reports the document id" bash -c "printf '%%PDF-1.4 pic\n' > '$T/drive/Photos/extra.pdf'; printf 'Photos/extra.pdf\n' > '$T/sel2.txt'; $DM pick --refresh --print >/dev/null 2>&1; $DM push --selection '$T/sel2.txt' --wait 2>&1 | grep -q 'imported Photos/extra.pdf → document'"
 set +e; "$DM" push --selection "$T/sel.txt" --tags-from-path >"$T/push2.log" 2>&1; rc2=$?; set -e
-check "re-run skips the two done, retries the failed one" bash -c "grep -q '0 imported, 2 already done, 1 failed' '$T/push2.log'"
+check "re-run skips the two done, retries the failed one" bash -c "grep -q '1 queued, 2 already done/queued, 0 failed' '$T/push2.log'"
 check "status summarises the ledger" bash -c "$DM status | grep -q 'ledger:'"
 echo "== Summary ==  Pass: $PASS  Fail: $FAIL"
 [ "$FAIL" -eq 0 ] && echo "[test] PASS" || { echo "[test] FAIL"; sed 's/^/      | /' "$T/push.log" | tail -20; exit 1; }
