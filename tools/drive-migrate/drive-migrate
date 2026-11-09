@@ -555,6 +555,11 @@ def cmd_push(a: argparse.Namespace) -> None:
             if a.source == "gdrive":
                 args += ["--drive-export-formats", EXPORT_FORMATS]
             r = rclone(cfg, args, capture=True, check=False)
+            if (r.returncode != 0 or not os.path.exists(local)) and a.source == "gdrive" and it.get("ID"):
+                # names with control characters or other encoding oddities fail the
+                # path round-trip; the Drive file id always works
+                r = rclone(cfg, ["backend", "copyid", "gdrive:", it["ID"], local, "--drive-export-formats", EXPORT_FORMATS],
+                           capture=True, check=False)
             base = {"ts": dt.datetime.now().isoformat(timespec="seconds"), "source": a.source, "path": path,
                     "drive_id": it.get("ID", ""), "size": it.get("Size", ""), "modtime": it.get("ModTime", "")}
             if r.returncode != 0 or not os.path.exists(local):
