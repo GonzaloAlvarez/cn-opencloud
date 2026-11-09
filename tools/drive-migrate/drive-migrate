@@ -57,7 +57,8 @@ LEDGER_FIELDS = ["ts", "source", "path", "drive_id", "size", "modtime", "task_id
 
 
 def log(msg: str) -> None:
-    print(f"[drive-migrate] {msg}", flush=True)
+    # progress/status goes to stderr so `pick --print` and friends stay pipeable
+    print(f"[drive-migrate] {msg}", file=sys.stderr, flush=True)
 
 
 def die(msg: str, code: int = 1) -> None:
