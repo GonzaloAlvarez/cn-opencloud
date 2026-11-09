@@ -624,7 +624,13 @@ def cmd_settle(a: argparse.Namespace) -> None:
     while queued and time.time() < deadline:
         still = []
         for r in queued:
-            info = pl.task_state(r["task_id"])
+            try:
+                info = pl.task_state(r["task_id"])
+            except Exception as e:  # noqa: BLE001 — a busy Paperless (OCR) or a network blip must not end the run
+                log(f"poll error ({e.__class__.__name__}: {str(e)[:80]}); will retry")
+                still.append(r)
+                time.sleep(5)
+                continue
             st = str((info or {}).get("status", "")).upper()
             if info is None:
                 r.update({"status": "vanished", "note": "task not found in Paperless"})
